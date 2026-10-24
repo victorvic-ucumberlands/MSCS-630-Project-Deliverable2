@@ -21,7 +21,13 @@ static long ms_between(Job::Clock::time_point a, Job::Clock::time_point b) {
 
 long Job::turnaround_ms() const { return finished() ? ms_between(arrival, finish) : 0; }
 long Job::response_ms() const { return ms_between(arrival, first_run); }
+// Waiting time = time spent ready to run but not holding the CPU.  For a
+// scheduler-managed process the shell measured that directly (ready_ms): it
+// excludes both the time the process held the CPU and the time it was blocked
+// in the kernel.  For a job the kernel scheduled freely (live scheduling off)
+// the consumed CPU time is the best available approximation.
 long Job::wait_ms() const {
+  if (scheduled || dispatches > 0) return ready_ms;
   long w = turnaround_ms() - (cpu_user_ms + cpu_sys_ms);
   return w < 0 ? 0 : w;  // clock granularity can make this slightly negative
 }

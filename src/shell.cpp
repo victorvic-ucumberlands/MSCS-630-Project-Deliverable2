@@ -1,28 +1,44 @@
-// shell.cpp - read-eval loop, process creation (fork/exec/wait) and job control.
+// shell.cpp - read-eval loop, process creation, job control, and the
+// integration of the resident CPU scheduler.
 //
 // Process model
 // -------------
 //  * Every external command runs in its own child created with fork() and
-//    replaced with execvp().  The child is placed in its *own process group*
-//    (pgid == pid) so signals aimed at a job (Ctrl-C, Ctrl-Z, kill %1) never
-//    hit the shell or other jobs.
-//  * Foreground job : the shell gives it the terminal (tcsetpgrp) and blocks in
-//    wait4(pid, WUNTRACED) until it exits, is killed, or is stopped.
-//  * Background job : the shell prints "[id] pid" and carries on.  Its state is
-//    collected later, without blocking, by reap_children() (wait4 + WNOHANG)
-//    which runs before every prompt - so no zombies accumulate.
-//  * Built-ins that change shell state (cd, exit, fg, bg, jobs, kill) run in
-//    the shell process itself; if the user appends '&' to a built-in it is run
-//    in a forked child like any other command.
+//    replaced with execvp().  The child is placed in its own process group
+//    (pgid == pid) so signals aimed at a job never hit the shell or other jobs.
+//  * Every such command is SCHEDULED BY THE SHELL (Deliverable 2).  The child
+//    stops itself just before exec; the shell admits it to the resident
+//    CpuScheduler with the default priority (or the one given with `prio`) and
+//    from then on only the scheduler continues (SIGCONT) or stops (SIGSTOP) it.
+//    `sched live off` returns to the Deliverable 1 behaviour, in which the
+//    kernel schedules the jobs freely.
+//  * The shell never blocks indefinitely: at the prompt and while waiting for a
+//    foreground job it sleeps in poll() on a signalfd (SIGCHLD and the
+//    terminal signals) and on its input, with the scheduler's timeout.  So the
+//    time slice is enforced, blocked processes are noticed and finished jobs
+//    are reaped while the user is typing.
+//  * Terminal ownership follows the CPU.  A foreground job owns the terminal
+//    while it is continued (running, or blocked e.g. waiting for keyboard
+//    input).  While the scheduler has it stopped in the ready queue the shell
+//    holds the terminal, so Ctrl-C and Ctrl-Z reach the shell, which applies
+//    them to the job through the scheduler.
+//  * Built-ins that change shell state (cd, exit, fg, bg, jobs, kill, sched)
+//    run in the shell process itself - the shell's equivalent of system calls
+//    executed by the kernel - and are not scheduled.  A built-in run with '&'
+//    is forked and scheduled like any other command.
 #include "shell.hpp"
 
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -48,13 +64,16 @@ static int open_redirect(const Redirect& r) {
 
 static long tv_ms(const struct timeval& tv) { return tv.tv_sec * 1000L + tv.tv_usec / 1000L; }
 
+static bool is_stop_signal(int s) { return s == SIGSTOP || s == SIGTSTP || s == SIGTTIN || s == SIGTTOU; }
+
 // ---------------------------------------------------------------------------
-// Construction: put the shell in its own process group and take the terminal.
+// Construction
 // ---------------------------------------------------------------------------
 Shell::Shell(bool interactive, bool echo_input)
     : interactive_(interactive), echo_input_(echo_input) {
   shell_pid = getpid();
   shell_pgid_ = getpgrp();
+  start_ms_ = proc::mono_ms();
   signal(SIGPIPE, SIG_IGN);  // a closed pipe must not kill the shell; write() gets EPIPE instead
 
   // A fresh shell has no "previous directory": drop an inherited OLDPWD so
@@ -63,31 +82,75 @@ Shell::Shell(bool interactive, bool echo_input)
   char cwd[4096];
   if (getcwd(cwd, sizeof cwd)) setenv("PWD", cwd, 1);
 
-  if (!interactive_) return;  // scripts: no terminal, no job-control signals
-
-  tty_fd_ = STDIN_FILENO;
-  // If we were started in the background, wait until we own the terminal.
-  while (true) {
-    pid_t fg = tcgetpgrp(tty_fd_);
-    if (fg < 0 || fg == (shell_pgid_ = getpgrp())) break;
-    kill(-shell_pgid_, SIGTTIN);
+  if (interactive_) {
+    tty_fd_ = STDIN_FILENO;
+    // If we were started in the background, wait until we own the terminal.
+    while (true) {
+      pid_t fg = tcgetpgrp(tty_fd_);
+      if (fg < 0 || fg == (shell_pgid_ = getpgrp())) break;
+      kill(-shell_pgid_, SIGTTIN);
+    }
+    // The shell itself must survive Ctrl-C / Ctrl-Z / Ctrl-\ and must be
+    // allowed to call tcsetpgrp() from a background process group.
+    signal(SIGINT, SIG_IGN);
+    signal(SIGQUIT, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+    signal(SIGTTIN, SIG_IGN);
+    signal(SIGTTOU, SIG_IGN);
+    if (setpgid(shell_pid, shell_pid) == 0) shell_pgid_ = shell_pid;
+    else shell_pgid_ = getpgrp();
+    tcsetpgrp(tty_fd_, shell_pgid_);
+    tcgetattr(tty_fd_, &shell_tmodes_);
   }
-  // The shell itself must survive Ctrl-C / Ctrl-Z / Ctrl-\ typed at the prompt,
-  // and must be allowed to call tcsetpgrp() from a non-foreground group.
-  signal(SIGINT, SIG_IGN);
-  signal(SIGQUIT, SIG_IGN);
-  signal(SIGTSTP, SIG_IGN);
-  signal(SIGTTIN, SIG_IGN);
-  signal(SIGTTOU, SIG_IGN);
 
-  if (setpgid(shell_pid, shell_pid) == 0) shell_pgid_ = shell_pid;  // EPERM if session leader: fine
-  else shell_pgid_ = getpgrp();
-  tcsetpgrp(tty_fd_, shell_pgid_);
-  tcgetattr(tty_fd_, &shell_tmodes_);  // remember sane terminal settings
+  // Signals the shell waits for are blocked and read from a signalfd, so
+  // they can be waited for together with input in one poll().  Blocked
+  // signals are queued even when their disposition is "ignore", which is how
+  // the interactive shell still learns about a Ctrl-C it received itself.
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGCHLD);
+  if (interactive_) {
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGQUIT);
+    sigaddset(&set, SIGTSTP);
+  }
+  sigprocmask(SIG_BLOCK, &set, nullptr);
+  sigfd_ = signalfd(-1, &set, SFD_NONBLOCK | SFD_CLOEXEC);
+
+  install_scheduler_hooks();
 }
+
+long Shell::now_ms() const { return proc::mono_ms() - start_ms_; }
 
 void Shell::give_terminal_to(pid_t pgid) {
   if (interactive_) tcsetpgrp(tty_fd_, pgid);
+}
+
+void Shell::trace(const char* kind, const std::string& detail) {
+  if (!live_trace) return;
+  fprintf(stderr, "[sched %6ld ms] %-8s %s  ready=%s\n", now_ms(), kind, detail.c_str(), cpu.ready_text().c_str());
+  fflush(stderr);
+}
+
+// Connect the scheduler to the shell: event trace, terminal ownership for the
+// foreground job, and job records for processes the scheduler reaped itself.
+void Shell::install_scheduler_hooks() {
+  cpu.log = [this](const char* kind, const std::string& d) { trace(kind, d); };
+  cpu.before_continue = [this](Job& j) {
+    if (interactive_ && fg_job_id_ && j.id == fg_job_id_ && jobs.find_by_id(j.id) == &j) give_terminal_to(j.pgid);
+  };
+  cpu.after_stop = [this](Job& j) {
+    if (interactive_ && fg_job_id_ && j.id == fg_job_id_ && jobs.find_by_id(j.id) == &j) give_terminal_to(shell_pgid_);
+  };
+  cpu.collected = [this](Job& j, int st, const struct rusage& ru) { update_from_status(j, st, ru); };
+  cpu.user_stopped = [this](Job& j, int sig) {
+    j.state = JobState::Stopped;
+    j.stop_signal = sig;
+    j.stop_count++;
+    jobs.touch(j);
+    if (j.id != fg_job_id_) stop_announce_.push_back(j.id);
+  };
 }
 
 std::string Shell::lookup_var(const std::string& name) {
@@ -108,37 +171,94 @@ std::string Shell::prompt() {
 }
 
 // ---------------------------------------------------------------------------
+// The event pump: the only place the shell sleeps
+// ---------------------------------------------------------------------------
+bool Shell::pump(long timeout_ms, bool watch_input) {
+  pollfd fds[2];
+  int n = 0;
+  fds[n++] = {sigfd_, POLLIN, 0};
+  if (watch_input) fds[n++] = {in_fd_, POLLIN, 0};
+  int r = poll(fds, n, (int)std::min<long>(timeout_ms, 1000000));
+  bool input = false;
+  if (r > 0) {
+    if (fds[0].revents & POLLIN) {
+      signalfd_siginfo si;
+      while (read(sigfd_, &si, sizeof si) == (ssize_t)sizeof si)
+        if (si.ssi_signo != SIGCHLD) pending_sigs_.push_back((int)si.ssi_signo);
+    }
+    if (watch_input && (fds[1].revents & (POLLIN | POLLHUP | POLLERR))) input = true;
+  }
+  reap_children(false);
+  schedule_tick();
+  return input;
+}
+
+void Shell::schedule_tick() {
+  if (live) cpu.tick();
+}
+
+// Read one line from in_fd_, keeping the scheduler and the reaper running
+// while waiting for it.
+bool Shell::read_line(std::string& line) {
+  for (;;) {
+    size_t nl = inbuf_.find('\n');
+    if (nl != std::string::npos) {
+      line = inbuf_.substr(0, nl);
+      inbuf_.erase(0, nl + 1);
+      return true;
+    }
+    if (in_eof_) {
+      if (inbuf_.empty()) return false;
+      line.swap(inbuf_);
+      inbuf_.clear();
+      return true;
+    }
+    pending_sigs_.clear();
+    bool ready = pump(cpu.timeout_ms(), true);
+    for (int s : pending_sigs_) {
+      if (s == SIGINT && interactive_) {                // Ctrl-C at the prompt: a fresh prompt
+        fputc('\n', stdout);
+        reap_children(true);
+        fputs(prompt().c_str(), stdout);
+        fflush(stdout);
+      }                                                 // Ctrl-Z / Ctrl-\ at the prompt: ignored
+    }
+    pending_sigs_.clear();
+    if (ready) {
+      char buf[8192];
+      ssize_t k = read(in_fd_, buf, sizeof buf);
+      if (k > 0) inbuf_.append(buf, (size_t)k);
+      else if (k == 0) in_eof_ = true;
+      else if (errno != EINTR && errno != EAGAIN) in_eof_ = true;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Read-eval loop
 // ---------------------------------------------------------------------------
-int Shell::run(FILE* in) {
-  char* buf = nullptr;
-  size_t cap = 0;
-
+int Shell::run(int fd) {
+  in_fd_ = fd;
   while (!exit_requested) {
-    reap_children(true);  // report finished/stopped background jobs before prompting
+    pump(0, false);              // between commands: reap and let the scheduler act
+    reap_children(true);         // report finished/stopped background jobs first
     if (interactive_) {
-      std::string p = prompt();
-      fputs(p.c_str(), stdout);
+      fputs(prompt().c_str(), stdout);
       fflush(stdout);
     }
-
-    ssize_t n = getline(&buf, &cap, in);
-    if (n < 0) {
-      if (errno == EINTR) { clearerr(in); continue; }
+    std::string line;
+    if (!read_line(line)) {
       if (interactive_) fputs("exit\n", stdout);  // Ctrl-D
       exit_code = last_status;
       break;
     }
-    std::string line(buf, (size_t)n);
-    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
-
+    while (!line.empty() && line.back() == '\r') line.pop_back();
     if (echo_input_ && !interactive_) {
       printf("myshell$ %s\n", line.c_str());
       fflush(stdout);
     }
     execute_line(line);
   }
-  free(buf);
   fflush(stdout);
   cleanup_jobs();
   return exit_code;
@@ -148,8 +268,7 @@ int Shell::run(FILE* in) {
 // command by command so that $? and cd take effect for later commands.
 void Shell::execute_line(const std::string& line) {
   if (line.size() > Parser::kMaxLine) {
-    fprintf(stderr, "myshell: input line too long (%zu bytes, limit %zu)\n", line.size(),
-            Parser::kMaxLine);
+    fprintf(stderr, "myshell: input line too long (%zu bytes, limit %zu)\n", line.size(), Parser::kMaxLine);
     last_status = 2;
     return;
   }
@@ -158,7 +277,6 @@ void Shell::execute_line(const std::string& line) {
     last_status = 2;
     return;
   }
-
   Command cmd;
   {  // pass 1: syntax check with a dummy variable lookup
     Parser check(line, [](const std::string&) { return std::string("x"); });
@@ -183,18 +301,78 @@ void Shell::execute_line(const std::string& line) {
       break;
     }
     run_command(cmd);
+    pump(0, false);              // let the scheduler see the new job straight away
   }
 }
 
 void Shell::run_command(const Command& cmd) {
   if (cmd.argv.empty()) return;
   if (cmd.argv[0] != "exit") exit_warned = false;
+  if (cmd.argv[0] == "prio") { run_prio(cmd); return; }
 
   BuiltinFn fn = find_builtin(cmd.argv[0]);
   if (fn && !cmd.background)
     run_builtin_inline(fn, cmd);
   else
-    launch(cmd, fn);  // external command, or built-in with '&'
+    launch(cmd, fn, default_priority);  // external command, or built-in with '&'
+}
+
+// `prio N COMMAND...` runs one command with priority N.
+// `prio N %JOB` changes the priority of an existing job (renice).
+// `prio` alone shows the default priority.
+void Shell::run_prio(const Command& cmd) {
+  const auto& a = cmd.argv;
+  if (a.size() == 1) {
+    printf("default priority %d (prio N COMMAND runs one command with priority N)\n", default_priority);
+    last_status = 0;
+    return;
+  }
+  long n = -1;
+  bool ok = a[1].size() <= 2 && !a[1].empty();
+  for (char c : a[1]) ok = ok && c >= '0' && c <= '9';
+  if (ok) n = std::strtol(a[1].c_str(), nullptr, 10);
+  if (!ok || n < 0 || n > 99) {
+    fprintf(stderr, "prio: priority must be an integer from 0 to 99, got '%s'\n", a[1].c_str());
+    last_status = 2;
+    return;
+  }
+  if (a.size() < 3) {
+    fprintf(stderr, "prio: usage: prio N COMMAND [ARGS...]   or   prio N %%JOB\n");
+    last_status = 2;
+    return;
+  }
+  if (!a[2].empty() && a[2][0] == '%') {                  // renice an existing job
+    if (a.size() > 3) { fprintf(stderr, "prio: too many arguments\n"); last_status = 2; return; }
+    reap_children(false);
+    std::string err;
+    Job* j = resolve_job(a[2], err);
+    if (!j || j->finished()) { fprintf(stderr, "prio: %s\n", j ? "job has finished" : err.c_str()); last_status = 1; return; }
+    int old = j->priority;
+    if (cpu.manages(*j)) cpu.renice(*j, (int)n);
+    else j->priority = (int)n;
+    trace("RENICE", (j->sched_label.empty() ? j->command : j->sched_label) + ": priority " +
+                        std::to_string(old) + " -> " + std::to_string(n));
+    printf("[%d] %s: priority %d -> %ld\n", j->id, j->command.c_str(), old, n);
+    fflush(stdout);
+    schedule_tick();                                      // a more urgent job may preempt now
+    last_status = 0;
+    return;
+  }
+  Command inner = cmd;
+  inner.argv.erase(inner.argv.begin(), inner.argv.begin() + 2);
+  // Drop "prio N" from the source text shown by `jobs`.
+  std::string t = cmd.text;
+  for (int word = 0; word < 2; ++word) {
+    size_t i = t.find_first_not_of(" \t");
+    i = (i == std::string::npos) ? t.size() : t.find_first_of(" \t", i);
+    t = (i == std::string::npos) ? "" : t.substr(i);
+  }
+  size_t s = t.find_first_not_of(" \t");
+  inner.text = (s == std::string::npos) ? "" : t.substr(s);
+
+  BuiltinFn fn = find_builtin(inner.argv[0]);
+  if (fn && !inner.background) run_builtin_inline(fn, inner);   // built-ins run in the shell
+  else launch(inner, fn, (int)n);
 }
 
 // Run a built-in inside the shell process, applying redirections temporarily:
@@ -204,7 +382,6 @@ void Shell::run_builtin_inline(BuiltinFn fn, const Command& cmd) {
   fflush(stderr);
   int saved[3] = {-1, -1, -1};
   bool ok = true;
-
   for (const Redirect& r : cmd.redirs) {
     int target = open_redirect(r);
     if (target < 0) { ok = false; break; }
@@ -213,7 +390,6 @@ void Shell::run_builtin_inline(BuiltinFn fn, const Command& cmd) {
     close(target);
   }
   int status = ok ? fn(*this, cmd.argv) : 1;
-
   fflush(stdout);
   fflush(stderr);
   for (int fd = 0; fd < 3; ++fd)
@@ -226,18 +402,23 @@ void Shell::run_builtin_inline(BuiltinFn fn, const Command& cmd) {
 // ---------------------------------------------------------------------------
 
 // Executed in the child after fork(): never returns.
-void Shell::child_exec(const Command& cmd, BuiltinFn fn) {
-  // 1. New process group; foreground jobs also take the terminal.  Both parent
-  //    and child call setpgid() to close the race of who runs first.
+void Shell::child_exec(const Command& cmd, BuiltinFn fn, bool scheduled) {
+  // 1. New process group.  When the kernel schedules the job (live off) a
+  //    foreground job takes the terminal itself, as in Deliverable 1; when the
+  //    shell schedules it, the shell hands over the terminal at dispatch.
   setpgid(0, 0);
-  if (!cmd.background) give_terminal_to(getpid());
+  if (!cmd.background && !scheduled) give_terminal_to(getpid());
 
-  // 2. Undo the shell's signal dispositions (ignored signals survive exec!).
-  for (int s : {SIGINT, SIGQUIT, SIGTSTP, SIGTTIN, SIGTTOU, SIGCHLD, SIGPIPE})
-    signal(s, SIG_DFL);
+  // 2. Normal signal handling for the program: nothing blocked, nothing ignored.
+  sigset_t none;
+  sigemptyset(&none);
+  sigprocmask(SIG_SETMASK, &none, nullptr);
+  for (int s : {SIGINT, SIGQUIT, SIGTSTP, SIGTTIN, SIGTTOU, SIGCHLD, SIGPIPE}) signal(s, SIG_DFL);
+  if (sigfd_ >= 0) close(sigfd_);
+  cpu.forget_all();            // this copy of the scheduler belongs to the parent
+  if (scheduled) prctl(PR_SET_PDEATHSIG, SIGKILL);   // a stopped child must not outlive the shell
 
-  // 3. Background jobs must not steal the shell's input: stdin <- /dev/null
-  //    (an explicit "< file" below overrides this).
+  // 3. Background jobs must not steal the shell's input: stdin <- /dev/null.
   if (cmd.background) {
     int nul = open("/dev/null", O_RDONLY);
     if (nul >= 0) { dup2(nul, STDIN_FILENO); close(nul); }
@@ -251,7 +432,10 @@ void Shell::child_exec(const Command& cmd, BuiltinFn fn) {
     close(fd);
   }
 
-  // 5. Built-in with '&': run it here and exit with its status.
+  // 5. Scheduled: wait in the ready queue until the scheduler continues us.
+  if (scheduled) raise(SIGSTOP);
+
+  // 6. Built-in with '&': run it here and exit with its status.
   if (fn) {
     int st = fn(*this, cmd.argv);
     fflush(stdout);
@@ -259,25 +443,27 @@ void Shell::child_exec(const Command& cmd, BuiltinFn fn) {
     _exit(st);
   }
 
-  // 6. Replace the process image.
+  // 7. Replace the process image.
   std::vector<char*> args;
   for (const auto& a : cmd.argv) args.push_back(const_cast<char*>(a.c_str()));
   args.push_back(nullptr);
   execvp(args[0], args.data());
-
-  int e = errno;  // exec failed
+  int e = errno;
   if (e == ENOENT && cmd.argv[0].find('/') == std::string::npos)
     fprintf(stderr, "myshell: %s: command not found\n", args[0]);
   else
     fprintf(stderr, "myshell: %s: %s\n", args[0], strerror(e));
-  _exit(e == ENOENT ? 127 : 126);  // same convention as POSIX shells
+  _exit(e == ENOENT ? 127 : 126);
 }
 
-void Shell::launch(const Command& cmd, BuiltinFn fn) {
+void Shell::launch(const Command& cmd, BuiltinFn fn, int priority) {
   // Flush buffered output first, otherwise the child would inherit a copy of
   // it and print it a second time.
   fflush(stdout);
   fflush(stderr);
+  // `sched` itself is a scheduler (an experiment run with '&'): it is never
+  // scheduled, or two schedulers would be stopping each other's processes.
+  const bool scheduled = live && !(fn && cmd.argv[0] == "sched");
 
   pid_t pid = fork();
   if (pid < 0) {
@@ -285,27 +471,129 @@ void Shell::launch(const Command& cmd, BuiltinFn fn) {
     last_status = 1;
     return;
   }
-  if (pid == 0) child_exec(cmd, fn);
+  if (pid == 0) child_exec(cmd, fn, scheduled);
 
-  // Parent.  Ignore errors: EACCES just means the child already exec'd and
-  // has already put itself in the group.
+  // Parent.  Ignore errors: EACCES just means the child already exec'd.
   setpgid(pid, pid);
   Job& job = jobs.add(pid, pid, cmd.text, !cmd.background);
+  job.priority = priority;
+  job.sched_label = short_label(cmd.argv);
+
+  if (scheduled) {
+    // Wait for the child to stop itself just before exec.
+    int st = 0;
+    struct rusage ru{};
+    pid_t got;
+    while ((got = wait4(pid, &st, WUNTRACED, &ru)) < 0 && errno == EINTR) {}
+    if (got > 0 && !WIFSTOPPED(st)) {
+      update_from_status(job, st, ru);   // it died before it could start (e.g. a redirection failed)
+    } else {
+      job.sched_arrival_ms = now_ms();
+      cpu.admit(job, job.id, job.sched_arrival_ms, job.serial);
+      trace("ARRIVE", job.sched_label + ": created (pid " + std::to_string((int)pid) + ", prio " +
+                          std::to_string(priority) + "), stopped in ready queue");
+    }
+  }
 
   if (cmd.background) {
     printf("[%d] %d\n", job.id, (int)pid);
     fflush(stdout);
     last_status = 0;
+    schedule_tick();                      // it may get the CPU straight away
   } else {
     last_status = wait_foreground(job);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Waiting and state tracking
+// Waiting for the foreground job
 // ---------------------------------------------------------------------------
+int Shell::wait_foreground(Job& job) {
+  if (!job.scheduled || !live) return wait_foreground_unscheduled(job);
+  const int id = job.id;
+  fg_job_id_ = id;
+  job.foreground = true;
 
-// Fold a wait4() status word into the job record.
+  // A job that is already continued (running, or blocked) owns the terminal now.
+  if (const CpuEntry* e = cpu.entry_of(job))
+    if (e->state == CpuEntry::State::Running || e->state == CpuEntry::State::Blocked) give_terminal_to(job.pgid);
+
+  schedule_tick();
+  for (;;) {
+    Job* j = jobs.find_by_id(id);
+    if (!j || j->finished() || j->state == JobState::Stopped) break;
+    pending_sigs_.clear();
+    pump(cpu.timeout_ms(), false);
+    // Terminal signals the shell received: the user meant the foreground job,
+    // but it was waiting in the ready queue, so the shell held the terminal.
+    for (int s : pending_sigs_) {
+      j = jobs.find_by_id(id);
+      if (!j || j->finished() || j->state == JobState::Stopped) break;
+      if (s == SIGTSTP) stop_for_user(*j, SIGTSTP);
+      else cpu.deliver(*j, s);          // SIGINT / SIGQUIT: act on it now
+    }
+    pending_sigs_.clear();
+  }
+  return finish_foreground(id);
+}
+
+// Deliverable 1 behaviour, used when the kernel schedules the job.
+int Shell::wait_foreground_unscheduled(Job& job) {
+  const int id = job.id;
+  fg_job_id_ = id;
+  give_terminal_to(job.pgid);
+  int status = 0;
+  struct rusage ru{};
+  pid_t r;
+  do {
+    r = wait4(job.pid, &status, WUNTRACED, &ru);
+  } while (r < 0 && errno == EINTR);
+  if (r < 0) {
+    fprintf(stderr, "myshell: wait4: %s\n", strerror(errno));
+    job.state = JobState::Done;
+    job.exit_status = 1;
+    job.finish = Job::Clock::now();
+  } else {
+    update_from_status(job, status, ru);
+  }
+  return finish_foreground(id);
+}
+
+// Take the terminal back and report how the foreground job ended.
+int Shell::finish_foreground(int id) {
+  fg_job_id_ = 0;
+  give_terminal_to(shell_pgid_);
+  if (interactive_) tcsetattr(tty_fd_, TCSADRAIN, &shell_tmodes_);  // undo terminal mode changes
+
+  Job* j = jobs.find_by_id(id);
+  if (!j) return 1;
+  if (j->state == JobState::Stopped) {             // Ctrl-Z: keep the job, it is now a background job
+    j->foreground = false;
+    jobs.touch(*j);
+    if (interactive_) fputc('\n', stdout);
+    announce(*j);
+    return 128 + j->stop_signal;
+  }
+  int rc;
+  if (j->state == JobState::Done) {
+    rc = j->exit_status;
+  } else {                                         // killed by a signal
+    rc = 128 + j->term_signal;
+    if (j->term_signal == SIGINT) {
+      if (interactive_) fputc('\n', stdout);
+    } else if (j->term_signal != SIGPIPE) {
+      fprintf(stderr, "myshell: pid %d terminated by signal %d (%s): %s\n", (int)j->pid, j->term_signal,
+              strsignal(j->term_signal), j->command.c_str());
+    }
+  }
+  j->notified = true;
+  jobs.retire(id);
+  return rc;
+}
+
+// ---------------------------------------------------------------------------
+// State tracking
+// ---------------------------------------------------------------------------
 void Shell::update_from_status(Job& job, int status, const struct rusage& ru) {
   job.cpu_user_ms = tv_ms(ru.ru_utime);
   job.cpu_sys_ms = tv_ms(ru.ru_stime);
@@ -324,85 +612,51 @@ void Shell::update_from_status(Job& job, int status, const struct rusage& ru) {
   }
 }
 
-// Block until the foreground job exits or stops; hand the terminal back.
-int Shell::wait_foreground(Job& job) {
-  const int id = job.id;
-  give_terminal_to(job.pgid);
-
-  int status = 0;
-  struct rusage ru{};
-  pid_t r;
-  do {
-    r = wait4(job.pid, &status, WUNTRACED, &ru);
-  } while (r < 0 && errno == EINTR);
-
-  give_terminal_to(shell_pgid_);                 // shell is foreground again
-  if (interactive_) tcsetattr(tty_fd_, TCSADRAIN, &shell_tmodes_);  // undo terminal mode changes
-
-  if (r < 0) {  // child vanished (should not happen)
-    fprintf(stderr, "myshell: wait4: %s\n", strerror(errno));
-    job.state = JobState::Done;
-    job.exit_status = 1;
-    job.finish = Job::Clock::now();
-    jobs.retire(id);
-    return 1;
-  }
-  update_from_status(job, status, ru);
-
-  if (job.state == JobState::Stopped) {          // Ctrl-Z or SIGSTOP: keep the job, move it to the background
-    job.foreground = false;
-    jobs.touch(job);
-    if (interactive_) fputc('\n', stdout);
-    announce(job);
-    return 128 + job.stop_signal;
-  }
-
-  int rc;
-  if (job.state == JobState::Done) {
-    rc = job.exit_status;
-  } else {                                        // killed by a signal
-    rc = 128 + job.term_signal;
-    if (job.term_signal == SIGINT) {
-      if (interactive_) fputc('\n', stdout);
-    } else if (job.term_signal != SIGPIPE) {
-      fprintf(stderr, "myshell: pid %d terminated by signal %d (%s): %s\n", (int)job.pid,
-              job.term_signal, strsignal(job.term_signal), job.command.c_str());
-    }
-  }
-  job.notified = true;
-  jobs.retire(id);
-  return rc;
-}
-
-// Collect status changes of background jobs without blocking.
+// Collect status changes of every child without blocking.  The scheduler's
+// own stops never show up here: it consumes them itself when it confirms a
+// stop, so a stop seen here was caused by the user (Ctrl-Z, kill -STOP from
+// another terminal).
 void Shell::reap_children(bool notify) {
   for (;;) {
     int status = 0;
     struct rusage ru{};
     pid_t pid = wait4(-1, &status, WNOHANG | WUNTRACED, &ru);
-    if (pid <= 0) break;                         // nothing changed (0) or no children (-1)
+    if (pid <= 0) break;
     Job* j = jobs.find_by_pid(pid);
     if (!j) continue;
     update_from_status(*j, status, ru);
     if (j->state == JobState::Stopped) {
+      if (cpu.manages(*j)) cpu.stopped_elsewhere(*j);
       jobs.touch(*j);
-      if (notify) announce(*j);
+      if (j->id != fg_job_id_) stop_announce_.push_back(j->id);
     } else if (j->finished()) {
-      if (notify) announce(*j);
-      j->notified = true;
-      jobs.retire(j->id);
+      if (cpu.manages(*j)) cpu.exited(*j);
     }
+  }
+  if (notify) flush_notifications();
+}
+
+// Report finished and stopped background jobs, then drop the finished ones.
+void Shell::flush_notifications() {
+  for (int id : stop_announce_)
+    if (Job* j = jobs.find_by_id(id))
+      if (j->state == JobState::Stopped && id != fg_job_id_) announce(*j);
+  stop_announce_.clear();
+  for (Job* j : jobs.active()) {
+    if (!j->finished() || j->id == fg_job_id_) continue;
+    if (!j->notified) announce(*j);
+    j->notified = true;
+    jobs.retire(j->id);
   }
 }
 
-// After signalling a job, give the kernel a moment to deliver it so the next
-// command sees the new state (keeps script output deterministic).
 void Shell::wait_for_change(int id, JobState old_state, int timeout_ms) {
-  for (int i = 0; i < timeout_ms; ++i) {
+  long end = proc::mono_ms() + timeout_ms;
+  while (proc::mono_ms() < end) {
+    pump(1, false);
     reap_children(true);
     Job* j = jobs.find_by_id(id);
     if (!j || j->state != old_state) return;
-    usleep(1000);
   }
 }
 
@@ -440,12 +694,11 @@ void Shell::announce(const Job& job) {
 }
 
 // ---------------------------------------------------------------------------
-// fg / bg support
+// Job control through the scheduler
 // ---------------------------------------------------------------------------
 Job* Shell::resolve_job(const std::string& spec, std::string& err) {
   std::string s = spec;
   if (!s.empty() && s[0] == '%') s.erase(0, 1);
-
   Job* j = nullptr;
   if (s.empty() || s == "+" || s == "%") {
     j = jobs.current();
@@ -463,16 +716,67 @@ Job* Shell::resolve_job(const std::string& spec, std::string& err) {
   return j;
 }
 
+// The user stops a scheduled job (Ctrl-Z, kill -STOP): it leaves the ready
+// queue and stays stopped until `bg`, `fg` or `kill -CONT`.
+void Shell::stop_for_user(Job& job, int sig) {
+  if (cpu.manages(job)) cpu.stop_for_user(job);
+  else kill(-job.pgid, SIGSTOP);
+  job.state = JobState::Stopped;
+  job.stop_signal = sig;
+  job.stop_count++;
+  jobs.touch(job);
+}
+
+void Shell::resume_job(Job& job) {
+  job.state = JobState::Running;
+  jobs.touch(job);
+  if (!cpu.manages(job)) {
+    cpu.admit(job, job.id, job.sched_arrival_ms, job.serial);
+    trace("RESUME", job.sched_label + ": back in the ready queue");
+  }
+  schedule_tick();
+}
+
+int Shell::signal_job(Job& job, int sig) {
+  if (sig == 0) return kill(-job.pgid, 0);
+  if (is_stop_signal(sig)) {
+    if (job.state != JobState::Stopped) {
+      stop_for_user(job, sig);
+      announce(job);
+    }
+    return 0;
+  }
+  if (sig == SIGCONT) {
+    if (job.state == JobState::Stopped) resume_job(job);
+    return 0;
+  }
+  if (sig == SIGKILL) return kill(-job.pgid, SIGKILL);   // works on stopped processes too
+  // Any other signal: a stopped job is put back in the queue first, then the
+  // scheduler delivers the signal so the job acts on it at once.
+  if (job.state == JobState::Stopped) resume_job(job);
+  cpu.deliver(job, sig);
+  return 0;
+}
+
 int Shell::foreground_job(Job& job) {
+  if (job.scheduled && live) {
+    fg_job_id_ = job.id;                 // before it can be dispatched: it gets the terminal
+    if (job.state == JobState::Stopped) resume_job(job);
+    job.foreground = true;
+    jobs.touch(job);
+    printf("%s\n", job.command.c_str());
+    fflush(stdout);
+    return wait_foreground(job);
+  }
   if (job.state == JobState::Stopped) {
-    kill(-job.pgid, SIGCONT);                    // resume the whole group
+    kill(-job.pgid, SIGCONT);
     job.state = JobState::Running;
   }
   job.foreground = true;
   jobs.touch(job);
-  printf("%s\n", job.command.c_str());           // echo the command like bash does
+  printf("%s\n", job.command.c_str());
   fflush(stdout);
-  return wait_foreground(job);
+  return wait_foreground_unscheduled(job);
 }
 
 int Shell::background_job(Job& job) {
@@ -480,34 +784,70 @@ int Shell::background_job(Job& job) {
     fprintf(stderr, "bg: job %d already in background\n", job.id);
     return 0;
   }
-  kill(-job.pgid, SIGCONT);
-  job.state = JobState::Running;
+  if (job.scheduled && live) {
+    resume_job(job);
+  } else {
+    kill(-job.pgid, SIGCONT);
+    job.state = JobState::Running;
+    jobs.touch(job);
+  }
   job.foreground = false;
-  jobs.touch(job);
   printf("[%d]%c %s &\n", job.id, &job == jobs.current() ? '+' : ' ', job.command.c_str());
   fflush(stdout);
   return 0;
+}
+
+// `sched live off`: every job goes back to the kernel.  `sched live on`: every
+// running job is stopped and queued, so from now on the shell schedules it.
+void Shell::set_live(bool on) {
+  if (on == live) return;
+  if (!on) {
+    cpu.release_all();
+    for (Job* j : jobs.active()) j->scheduled = false;
+    live = false;
+    return;
+  }
+  live = true;
+  for (Job* j : jobs.active()) {
+    if (j->finished()) continue;
+    j->scheduled = true;
+    if (j->state == JobState::Stopped) continue;   // stays stopped until bg/fg
+    kill(-j->pgid, SIGSTOP);
+    int st = 0;
+    struct rusage ru{};
+    pid_t got;
+    while ((got = wait4(j->pid, &st, WUNTRACED, &ru)) < 0 && errno == EINTR) {}
+    if (got > 0 && !WIFSTOPPED(st)) { update_from_status(*j, st, ru); continue; }
+    if (j->sched_label.empty()) j->sched_label = j->command;
+    j->sched_arrival_ms = now_ms();
+    cpu.admit(*j, j->id, j->sched_arrival_ms, j->serial);
+  }
+  schedule_tick();
 }
 
 // ---------------------------------------------------------------------------
 // Shutdown: never leave orphan children behind.
 // ---------------------------------------------------------------------------
 void Shell::cleanup_jobs() {
+  cpu.forget_all();                              // no more scheduling decisions
   auto act = jobs.active();
-  if (act.empty()) return;
-  fprintf(stderr, "myshell: terminating %zu remaining job(s)\n", act.size());
-  for (Job* j : act) {
+  std::vector<Job*> alive;
+  for (Job* j : act)
+    if (!j->finished()) alive.push_back(j);
+  if (alive.empty()) return;
+  fprintf(stderr, "myshell: terminating %zu remaining job(s)\n", alive.size());
+  for (Job* j : alive) {
     kill(-j->pgid, SIGHUP);
-    if (j->state == JobState::Stopped) kill(-j->pgid, SIGCONT);  // a stopped process can't act on SIGHUP
+    kill(-j->pgid, SIGCONT);                     // a stopped process can't act on SIGHUP
   }
-  for (Job* j : act) {
+  for (Job* j : alive) {
     int status = 0;
     bool reaped = false;
     for (int i = 0; i < 300 && !reaped; ++i) {   // ~300 ms grace period
       reaped = waitpid(j->pid, &status, WNOHANG) != 0;
       if (!reaped) usleep(1000);
     }
-    if (!reaped) {                               // ignored SIGHUP: escalate
+    if (!reaped) {
       kill(-j->pgid, SIGKILL);
       waitpid(j->pid, &status, 0);
     }

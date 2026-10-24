@@ -14,5 +14,8 @@ using BuiltinFn = int (*)(Shell&, const std::vector<std::string>&);
 // Returns the handler for `name`, or nullptr if `name` is not a built-in.
 BuiltinFn find_builtin(const std::string& name);
 
+// `sched` (Deliverable 2) lives in sched_builtin.cpp.
+int builtin_sched(Shell& sh, const std::vector<std::string>& args);
+
 // Signal helpers shared with the shell core (job notifications).
 const char* signal_short_name(int sig);   // "TERM", "KILL", ... or nullptr

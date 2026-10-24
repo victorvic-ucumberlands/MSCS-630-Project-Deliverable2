@@ -511,6 +511,22 @@ static int builtin_kill(Shell& sh, const Args& a) {
       job = sh.jobs.find_by_pid((pid_t)pid);
     }
 
+    // A job the shell schedules: stopping and continuing go through the
+    // scheduler (a SIGCONT sent directly would let it run beside the process
+    // holding the CPU), and other signals are delivered so it acts at once.
+    if (job && job->scheduled && sh.live && !job->finished()) {
+      const int id = job->id;
+      const JobState old = job->state;
+      if (sh.signal_job(*job, sig) < 0) {
+        fprintf(stderr, "kill: (%s) - %s\n", t.c_str(), strerror(errno));
+        rc = 1;
+        continue;
+      }
+      if (sig != 0 && sig != SIGCONT && sig != SIGSTOP && sig != SIGTSTP && sig != SIGTTIN && sig != SIGTTOU)
+        sh.wait_for_change(id, old == JobState::Stopped ? JobState::Running : old, 500);
+      continue;
+    }
+
     if (::kill(target, sig) < 0) {
       fprintf(stderr, "kill: (%s) - %s\n", t.c_str(), strerror(errno));
       rc = 1;
@@ -558,16 +574,23 @@ static int builtin_jobs(Shell& sh, const Args& a) {
     for (const Job& j : sh.jobs.history()) rows.push_back(&j);
     for (Job* j : sh.jobs.active()) rows.push_back(j);
     std::sort(rows.begin(), rows.end(), [](const Job* x, const Job* y) { return x->serial < y->serial; });
-    printf("%-4s %-3s %-7s %-7s %-11s %-9s %-5s %-9s %-8s %-8s %-5s %s\n", "REC", "JOB", "PID", "PGID", "STATE",
-           "RESULT", "PRIO", "TURN(ms)", "RESP(ms)", "CPU(ms)", "STOPS", "COMMAND");
+    // TURN = exit - start; WAIT = time in the ready queue; RESP = first time on
+    // the CPU - start; HELD = time holding the CPU; BLOCK = time blocked in the
+    // kernel; CPU = CPU time the kernel charged (wait4); SLICES = dispatches.
+    printf("%-4s %-3s %-7s %-11s %-9s %-4s %-8s %-8s %-8s %-8s %-9s %-7s %-6s %-5s %s\n", "REC", "JOB", "PID",
+           "STATE", "RESULT", "PRIO", "TURN(ms)", "WAIT(ms)", "RESP(ms)", "HELD(ms)", "BLOCK(ms)", "CPU(ms)",
+           "SLICES", "STOPS", "COMMAND");
     for (const Job* j : rows) {
-      char result[24] = "-", turn[16] = "-";
+      char result[24] = "-", turn[16] = "-", wait[16] = "-";
       if (j->state == JobState::Done) snprintf(result, sizeof result, "exit %d", j->exit_status);
       if (j->state == JobState::Terminated) snprintf(result, sizeof result, "sig %d", j->term_signal);
-      if (j->finished()) snprintf(turn, sizeof turn, "%ld", j->turnaround_ms());
-      printf("%-4lu %-3d %-7d %-7d %-11s %-9s %-5d %-9s %-8ld %-8ld %-5d %s\n", j->serial, j->id, (int)j->pid,
-             (int)j->pgid, to_string(j->state), result, j->priority, turn, j->response_ms(),
-             j->cpu_user_ms + j->cpu_sys_ms, j->stop_count, j->command.c_str());
+      if (j->finished()) {
+        snprintf(turn, sizeof turn, "%ld", j->turnaround_ms());
+        snprintf(wait, sizeof wait, "%ld", j->wait_ms());
+      }
+      printf("%-4lu %-3d %-7d %-11s %-9s %-4d %-8s %-8s %-8ld %-8ld %-9ld %-7ld %-6d %-5d %s\n", j->serial, j->id,
+             (int)j->pid, to_string(j->state), result, j->priority, turn, wait, j->response_ms(), j->dispatched_ms,
+             j->blocked_ms, j->cpu_user_ms + j->cpu_sys_ms, j->dispatches, j->stop_count, j->command.c_str());
     }
     return 0;
   }
@@ -615,6 +638,9 @@ static int builtin_help(Shell&, const Args&) {
        "  jobs [-l] [-p] [-a] list jobs (-a = full accounting records)\n"
        "  fg [%job]           bring a job to the foreground\n"
        "  bg [%job]           resume a stopped job in the background\n"
+       "  prio N COMMAND      run COMMAND with scheduling priority N (0-99, lower = more urgent)\n"
+       "  prio N %job         change the priority of a job\n"
+       "  sched ...           the CPU scheduler: policy, ps, trace, experiments (sched help)\n"
        "  exit [code]         leave the shell\n"
        "syntax: cmd &   cmd1 ; cmd2   > >> < 2>   'quotes' \"quotes\"   $VAR $? $$   # comment");
   return 0;
@@ -630,7 +656,7 @@ BuiltinFn find_builtin(const std::string& name) {
       {"cat", builtin_cat},     {"mkdir", builtin_mkdir}, {"rmdir", builtin_rmdir},
       {"rm", builtin_rm},       {"touch", builtin_touch}, {"kill", builtin_kill},
       {"jobs", builtin_jobs},   {"fg", builtin_fg},       {"bg", builtin_bg},
-      {"help", builtin_help}};
+      {"help", builtin_help},   {"sched", builtin_sched}};
   auto it = table.find(name);
   return it == table.end() ? nullptr : it->second;
 }

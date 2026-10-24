@@ -15,9 +15,9 @@
 #include <string>
 #include <vector>
 
-// Life-cycle of a job.  New/Ready are not used by Deliverable 1 (every job is
-// started immediately, so it goes straight to Running) but are defined so a
-// later scheduler can hold jobs in a ready queue without changing this enum.
+// Life-cycle of a job.  Real shell jobs start immediately and go straight to
+// Running.  New/Ready are used by the scheduler (Deliverable 2): New = not yet
+// arrived, Ready = waiting in the ready queue, Running = holds the CPU.
 enum class JobState {
   New,         // record created, process not yet forked      (scheduler use)
   Ready,       // runnable, waiting for the CPU / a time slice  (scheduler use)
@@ -47,11 +47,24 @@ struct Job {
   int stop_signal = 0;      // last stop signal (valid when Stopped)
   bool notified = false;    // completion message already shown to the user
 
-  // ---- scheduler-facing fields (used from Deliverable 2 on) -------------
-  int  priority = 0;            // nice-like value; lower = more urgent
-  int  queue_level = 0;         // multilevel-feedback-queue level
-  long burst_estimate_ms = 0;   // predicted CPU burst (0 = unknown)
-  long remaining_ms = 0;        // remaining CPU time for simulated policies
+  // ---- scheduler-facing fields (used by the Deliverable 2 scheduler) ----
+  // A scheduler-managed process is an ordinary child of the shell that the
+  // shell itself decides when to run (cpu_sched.hpp).  It is either waiting in
+  // the ready queue as a really stopped process (kernel state 'T'), holding
+  // the CPU, or blocked in the kernel.  `state` above keeps its Deliverable 1
+  // meaning (Running = alive and not stopped by the user); the fine-grained
+  // CPU state lives in the scheduler's own entry for the process.
+  bool scheduled = false;       // the shell's scheduler decides when it runs
+  int  dispatches = 0;          // times the scheduler gave it the CPU
+  int  preemptions = 0;         // times it lost the CPU before finishing
+  long dispatched_ms = 0;       // total time it held the CPU
+  long ready_ms = 0;            // total time it waited in the ready queue = WAITING TIME
+  long blocked_ms = 0;          // total time it was blocked in the kernel (sleep, I/O)
+  long sched_arrival_ms = 0;    // arrival key used for first-come-first-served tie-breaks
+  std::string sched_label;      // short name shown by the scheduler (empty = command)
+  int  priority = 0;            // 0..99, lower number = higher priority
+  int  queue_level = 0;         // multilevel-feedback-queue level (future policies)
+  long burst_estimate_ms = 0;   // predicted CPU burst (0 = unknown; future policies)
 
   // ---- accounting -------------------------------------------------------
   Clock::time_point arrival{};    // when the job entered the system
@@ -70,7 +83,7 @@ struct Job {
   // Derived metrics (milliseconds).  Only meaningful once finished().
   long turnaround_ms() const;  // finish - arrival
   long response_ms() const;    // first_run - arrival
-  long wait_ms() const;        // turnaround - cpu time (approximation of time not on CPU)
+  long wait_ms() const;        // time in the ready queue (scheduled) / turnaround - cpu (otherwise)
 };
 
 // Owns every job record.  Active jobs live in a std::list (stable addresses, so
